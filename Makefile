@@ -199,6 +199,7 @@ UPROGS=\
 	$U/_sixfive\
 	$U/_memdump\
 	$U/_find\
+	$U/_uptime\
 
 
 
