@@ -105,3 +105,16 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_interpose(void)
+{
+  int mask;
+  struct proc *p = myproc();
+
+  argint(0, &mask);
+  if(argstr(1, p->interpose_path, sizeof(p->interpose_path)) < 0)
+    return -1;
+  p->interpose_mask = mask;
+  return 0;
+}

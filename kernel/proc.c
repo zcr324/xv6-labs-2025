@@ -124,6 +124,8 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->interpose_mask = 0;
+  p->interpose_path[0] = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -278,6 +280,11 @@ kfork(void)
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
+
+  // A sandbox applies to the process and all of its descendants.
+  np->interpose_mask = p->interpose_mask;
+  safestrcpy(np->interpose_path, p->interpose_path,
+             sizeof(np->interpose_path));
 
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)

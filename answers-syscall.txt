@@ -1,0 +1,14 @@
+1. usertrap() calls syscall(). The trap originated in user space and enters
+   usertrap(), which recognizes the environment call and dispatches syscall().
+
+2. p->trapframe->a7 is 15 (0xf), SYS_open. Register a7 carries the system-call
+   number; init's first system call opens the console.
+
+3. The previous privilege mode was user mode. The SPP bit in sstatus is zero,
+   which records U-mode as the privilege level before the trap.
+
+4. The faulting instruction is `lw a3,0(zero)`. Register a3 holds the compiler's
+   value for num at that point. The kernel crashes because virtual address zero
+   is not mapped in the kernel page table; scause 0xd denotes a load page fault.
+
+5. The process running at the deliberate null dereference is init, with pid 1.
