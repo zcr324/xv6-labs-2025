@@ -21,12 +21,13 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+} kmem[NCPU];
 
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
+  for(int i = 0; i < NCPU; i++)
+    initlock(&kmem[i].lock, "kmem");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -56,10 +57,14 @@ kfree(void *pa)
 
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  push_off();
+  int id = cpuid();
+  pop_off();
+
+  acquire(&kmem[id].lock);
+  r->next = kmem[id].freelist;
+  kmem[id].freelist = r;
+  release(&kmem[id].lock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -68,13 +73,53 @@ kfree(void *pa)
 void *
 kalloc(void)
 {
-  struct run *r;
+  struct run *r = 0;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
+  push_off();
+  int id = cpuid();
+  pop_off();
+
+  acquire(&kmem[id].lock);
+  r = kmem[id].freelist;
   if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+    kmem[id].freelist = r->next;
+  release(&kmem[id].lock);
+
+  // Refill an empty local list by taking roughly half of a donor's list.
+  // The local lock is not held while acquiring a donor lock, avoiding
+  // lock-order cycles between CPUs that steal at the same time.
+  if(r == 0){
+    for(int donor = 0; donor < NCPU; donor++){
+      if(donor == id)
+        continue;
+
+      acquire(&kmem[donor].lock);
+      struct run *batch = kmem[donor].freelist;
+      if(batch != 0){
+        // Move the list in constant time. Keeping donor critical sections
+        // short is more important here than balancing the lists exactly.
+        kmem[donor].freelist = 0;
+      }
+      release(&kmem[donor].lock);
+
+      if(batch != 0){
+        r = batch;
+        struct run *rest = r->next;
+        r->next = 0;
+        if(rest != 0){
+          acquire(&kmem[id].lock);
+          while(rest){
+            struct run *next = rest->next;
+            rest->next = kmem[id].freelist;
+            kmem[id].freelist = rest;
+            rest = next;
+          }
+          release(&kmem[id].lock);
+        }
+        break;
+      }
+    }
+  }
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
