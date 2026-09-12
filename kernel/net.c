@@ -19,6 +19,37 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+#define NPORTS 64
+#define NPACKETS 16
+
+struct netpacket {
+  char *buf;
+  int len;
+  int payload_offset;
+  uint32 src;
+  uint16 sport;
+};
+
+struct portqueue {
+  int used;
+  uint16 port;
+  int head;
+  int count;
+  struct netpacket packets[NPACKETS];
+};
+
+static struct portqueue portqueues[NPORTS];
+
+// netlock must be held.
+static struct portqueue *
+findqueue(uint16 port)
+{
+  for(int i = 0; i < NPORTS; i++)
+    if(portqueues[i].used && portqueues[i].port == port)
+      return &portqueues[i];
+  return 0;
+}
+
 void
 netinit(void)
 {
@@ -34,9 +65,27 @@ netinit(void)
 uint64
 sys_bind(void)
 {
-  //
-  // Your code here.
-  //
+  int port;
+  argint(0, &port);
+  if(port < 0 || port > 0xffff)
+    return -1;
+
+  acquire(&netlock);
+  if(findqueue((uint16)port) != 0){
+    release(&netlock);
+    return -1;
+  }
+  for(int i = 0; i < NPORTS; i++){
+    if(!portqueues[i].used){
+      portqueues[i].used = 1;
+      portqueues[i].port = port;
+      portqueues[i].head = 0;
+      portqueues[i].count = 0;
+      release(&netlock);
+      return 0;
+    }
+  }
+  release(&netlock);
 
   return -1;
 }
@@ -49,10 +98,26 @@ sys_bind(void)
 uint64
 sys_unbind(void)
 {
-  //
-  // Optional: Your code here.
-  //
+  int port;
+  argint(0, &port);
+  if(port < 0 || port > 0xffff)
+    return -1;
 
+  acquire(&netlock);
+  struct portqueue *q = findqueue((uint16)port);
+  if(q == 0){
+    release(&netlock);
+    return -1;
+  }
+  while(q->count > 0){
+    struct netpacket *pkt = &q->packets[q->head];
+    kfree(pkt->buf);
+    q->head = (q->head + 1) % NPACKETS;
+    q->count--;
+  }
+  q->used = 0;
+  wakeup(q);
+  release(&netlock);
   return 0;
 }
 
@@ -74,10 +139,46 @@ sys_unbind(void)
 uint64
 sys_recv(void)
 {
-  //
-  // Your code here.
-  //
-  return -1;
+  struct proc *p = myproc();
+  int dport, maxlen;
+  uint64 srcaddr, sportaddr, bufaddr;
+  argint(0, &dport);
+  argaddr(1, &srcaddr);
+  argaddr(2, &sportaddr);
+  argaddr(3, &bufaddr);
+  argint(4, &maxlen);
+  if(dport < 0 || dport > 0xffff || maxlen < 0)
+    return -1;
+
+  acquire(&netlock);
+  struct portqueue *q = findqueue((uint16)dport);
+  if(q == 0){
+    release(&netlock);
+    return -1;
+  }
+  while(q->count == 0){
+    if(killed(p) || !q->used || q->port != (uint16)dport){
+      release(&netlock);
+      return -1;
+    }
+    sleep(q, &netlock);
+  }
+
+  struct netpacket pkt = q->packets[q->head];
+  q->head = (q->head + 1) % NPACKETS;
+  q->count--;
+  release(&netlock);
+
+  int n = pkt.len;
+  if(n > maxlen)
+    n = maxlen;
+  int error = 0;
+  if(copyout(p->pagetable, srcaddr, (char *)&pkt.src, sizeof(pkt.src)) < 0 ||
+     copyout(p->pagetable, sportaddr, (char *)&pkt.sport, sizeof(pkt.sport)) < 0 ||
+     copyout(p->pagetable, bufaddr, pkt.buf + pkt.payload_offset, n) < 0)
+    error = -1;
+  kfree(pkt.buf);
+  return error < 0 ? -1 : n;
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -134,6 +235,8 @@ sys_send(void)
   argaddr(3, &bufaddr);
   argint(4, &len);
 
+  if(len < 0)
+    return -1;
   int total = len + sizeof(struct eth) + sizeof(struct ip) + sizeof(struct udp);
   if(total > PGSIZE)
     return -1;
@@ -174,7 +277,10 @@ sys_send(void)
     return -1;
   }
 
-  e1000_transmit(buf, total);
+  if(e1000_transmit(buf, total) < 0){
+    kfree(buf);
+    return -1;
+  }
 
   return 0;
 }
@@ -188,10 +294,55 @@ ip_rx(char *buf, int len)
     printf("ip_rx: received an IP packet\n");
   seen_ip = 1;
 
-  //
-  // Your code here.
-  //
-  
+  if(len < sizeof(struct eth) + sizeof(struct ip)){
+    kfree(buf);
+    return;
+  }
+
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+  int ip_header_len = (ip->ip_vhl & 0x0f) * 4;
+  if((ip->ip_vhl >> 4) != 4 || ip_header_len < sizeof(struct ip) ||
+     ip->ip_p != IPPROTO_UDP || ntohl(ip->ip_dst) != local_ip ||
+     len < sizeof(struct eth) + ip_header_len + sizeof(struct udp)){
+    kfree(buf);
+    return;
+  }
+
+  int ip_len = ntohs(ip->ip_len);
+  if(ip_len < ip_header_len + sizeof(struct udp) ||
+     ip_len > len - sizeof(struct eth)){
+    kfree(buf);
+    return;
+  }
+
+  struct udp *udp = (struct udp *)((char *)ip + ip_header_len);
+  int udp_len = ntohs(udp->ulen);
+  if(udp_len < sizeof(struct udp) ||
+     udp_len > ip_len - ip_header_len){
+    kfree(buf);
+    return;
+  }
+
+  uint16 dport = ntohs(udp->dport);
+  acquire(&netlock);
+  struct portqueue *q = findqueue(dport);
+  if(q == 0 || q->count == NPACKETS){
+    release(&netlock);
+    kfree(buf);
+    return;
+  }
+
+  int tail = (q->head + q->count) % NPACKETS;
+  q->packets[tail].buf = buf;
+  q->packets[tail].len = udp_len - sizeof(struct udp);
+  q->packets[tail].payload_offset =
+    sizeof(struct eth) + ip_header_len + sizeof(struct udp);
+  q->packets[tail].src = ntohl(ip->ip_src);
+  q->packets[tail].sport = ntohs(udp->sport);
+  q->count++;
+  wakeup(q);
+  release(&netlock);
 }
 
 //
@@ -237,7 +388,8 @@ arp_rx(char *inbuf)
   memmove(arp->tha, ineth->shost, ETHADDR_LEN);
   arp->tip = inarp->sip;
 
-  e1000_transmit(buf, sizeof(*eth) + sizeof(*arp));
+  if(e1000_transmit(buf, sizeof(*eth) + sizeof(*arp)) < 0)
+    kfree(buf);
 
   kfree(inbuf);
 }
