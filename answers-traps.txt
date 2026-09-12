@@ -1,0 +1,28 @@
+1. RISC-V integer function arguments are passed in registers a0 through a7.
+In main's call to printf, 13 is the third argument and is held in a2.
+
+2. There is no call instruction to f or g in main. With the optimization used
+by the xv6 Makefile, the compiler inlines both computations and emits the final
+value 12 directly as printf's second argument in a1.
+
+3. In the generated user/call.asm for this branch, printf is located at virtual
+address 0x706.
+
+4. main executes the jal to printf at 0x30. Since jal saves the address of the
+following instruction, ra contains 0x34 immediately after the jump.
+
+5. The code prints:
+
+He110 World
+
+57616 is 0xe110 in hexadecimal. RISC-V stores i in little-endian order, so the
+bytes at &i are 0x72, 0x6c, 0x64, and 0x00, which form the string "rld". If the
+machine were big-endian, i should be 0x726c6400 to place those same bytes in
+increasing memory addresses. 57616 would not need to change because printf
+receives its integer value, not a byte-string representation of it.
+
+6. The value printed after y= is indeterminate rather than a particular number.
+The format string asks printf for two integer variadic arguments, but the caller
+supplies only one. printf therefore reads the unspecified value left in the next
+argument register (a2). Supplying fewer variadic arguments than required by the
+format string is undefined behavior.
