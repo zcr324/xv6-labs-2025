@@ -1,0 +1,31 @@
+1. Inspect a user-process page table
+
+Each printed PTE contains a physical-page number in its upper bits and Sv39
+status/permission flags in its low ten bits.  The physical addresses need not
+be consecutive because xv6 allocates physical pages independently.
+
+The mappings beginning at virtual address 0 contain the process image.  The
+text pages have V, R, X, and U set (0x5b once the A bit has been set), so user
+code can read and execute them but cannot write them.  Writable data/heap pages
+have V, R, W, and U set (for example 0x17 before access); hardware may later set
+A and D, producing values such as 0xd7.  The guard page below the user stack has
+V, R, and W but not U (0x07), so the kernel has a valid mapping while user mode
+cannot access it.  Entries printed as zero are unmapped virtual pages.
+
+At the high end of the address space, USYSCALL is mapped V, R, and U (0x13):
+user mode may read the process identifier but may not modify it.  TRAPFRAME is
+mapped V, R, and W without U (typically 0xc7 after access), because only the
+kernel and trampoline code should access saved registers.  TRAMPOLINE is mapped
+V, R, and X without U (typically 0x4b after access), allowing supervisor-mode
+trap entry and return code to execute while preventing direct user access.
+The A (accessed) and D (dirty) bits account for differences between otherwise
+identical permission values observed at different times.
+
+2. Other system calls that could use a shared read-only page
+
+uptime() is a suitable candidate.  The kernel could expose the tick counter in
+a user-readable, read-only shared page, allowing user code to read it without an
+ecall.  The kernel would remain the only writer, and the implementation would
+need to ensure that the counter is read consistently.  More generally, other
+small, frequently read process properties could use the same mechanism, but
+calls whose result depends on file-system state, permissions, or side effects

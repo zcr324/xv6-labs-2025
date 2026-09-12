@@ -23,11 +23,27 @@ struct {
   struct run *freelist;
 } kmem;
 
+// Reserve enough aligned 2 MiB chunks for a parent and its forked child.
+#define NSUPERPAGE 16
+#define SUPERSTART (PHYSTOP - NSUPERPAGE * SUPERPGSIZE)
+
+struct superrun {
+  struct superrun *next;
+};
+
+struct {
+  struct spinlock lock;
+  struct superrun *freelist;
+} supermem;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
-  freerange(end, (void*)PHYSTOP);
+  initlock(&supermem.lock, "supermem");
+  freerange(end, (void*)SUPERSTART);
+  for(uint64 pa = SUPERSTART; pa < PHYSTOP; pa += SUPERPGSIZE)
+    superfree((void*)pa);
 }
 
 void
@@ -78,5 +94,41 @@ kalloc(void)
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
+  return (void*)r;
+}
+
+// Free one aligned 2 MiB physical-memory chunk.
+void
+superfree(void *pa)
+{
+  struct superrun *r;
+
+  if(((uint64)pa % SUPERPGSIZE) != 0 ||
+     (uint64)pa < SUPERSTART || (uint64)pa >= PHYSTOP)
+    panic("superfree");
+
+  memset(pa, 1, SUPERPGSIZE);
+  r = (struct superrun*)pa;
+
+  acquire(&supermem.lock);
+  r->next = supermem.freelist;
+  supermem.freelist = r;
+  release(&supermem.lock);
+}
+
+// Allocate one physically aligned 2 MiB chunk.
+void *
+superalloc(void)
+{
+  struct superrun *r;
+
+  acquire(&supermem.lock);
+  r = supermem.freelist;
+  if(r)
+    supermem.freelist = r->next;
+  release(&supermem.lock);
+
+  if(r)
+    memset((char*)r, 5, SUPERPGSIZE);
   return (void*)r;
 }
