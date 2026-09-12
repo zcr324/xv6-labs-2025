@@ -299,7 +299,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -308,13 +307,14 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;   // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    if(flags & PTE_W){
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
+    }
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+    kaddref((void *)pa);
   }
   return 0;
 
@@ -349,12 +349,17 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
-  
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
+
+    pte = walk(pagetable, va0, 0);
+    if(pte != 0 && (*pte & (PTE_V | PTE_U | PTE_COW)) ==
+                   (PTE_V | PTE_U | PTE_COW)){
       if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
         return -1;
       }
+    } else {
+      pa0 = walkaddr(pagetable, va0);
+      if(pa0 == 0 && (pa0 = vmfault(pagetable, va0, 0)) == 0)
+        return -1;
     }
 
     pte = walk(pagetable, va0, 0);
@@ -454,13 +459,29 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
 {
   uint64 mem;
   struct proc *p = myproc();
+  pte_t *pte;
 
   if (va >= p->sz)
     return 0;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
-    return 0;
+
+  pte = walk(pagetable, va, 0);
+  if(pte != 0 && (*pte & PTE_V)){
+    if(read || (*pte & PTE_U) == 0 || (*pte & PTE_COW) == 0)
+      return 0;
+
+    uint64 oldpa = PTE2PA(*pte);
+    uint flags = PTE_FLAGS(*pte);
+    mem = (uint64)kalloc();
+    if(mem == 0)
+      return 0;
+    memmove((void *)mem, (void *)oldpa, PGSIZE);
+    *pte = PA2PTE(mem) | ((flags | PTE_W) & ~PTE_COW);
+    kfree((void *)oldpa);
+    sfence_vma();
+    return mem;
   }
+
   mem = (uint64) kalloc();
   if(mem == 0)
     return 0;
