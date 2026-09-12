@@ -446,14 +446,19 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 }
 
 // allocate and map user memory if process is referencing a page
-// that was lazily allocated in sys_sbrk().
+// that was lazily allocated in sys_sbrk() or mmap().
+// write is non-zero if the faulting access was a store.
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
 uint64
-vmfault(pagetable_t pagetable, uint64 va, int read)
+vmfault(pagetable_t pagetable, uint64 va, int write)
 {
   uint64 mem;
   struct proc *p = myproc();
+
+  // is this a page in an mmap'd region?
+  if((mem = vmafault(p, va, write)) != 0)
+    return mem;
 
   if (va >= p->sz)
     return 0;

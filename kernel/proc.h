@@ -81,6 +81,19 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+// A virtual memory area created by mmap().
+struct vma {
+  int used;             // is this slot in use?
+  uint64 addr;          // starting virtual address
+  int len;              // length in bytes
+  int prot;             // PROT_READ and/or PROT_WRITE
+  int flags;            // MAP_SHARED or MAP_PRIVATE
+  struct file *f;       // file being mapped
+  int off;              // offset in the file
+};
+
+#define NVMA 16
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -104,4 +117,5 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  struct vma vma[NVMA];        // mmap'd regions
 };

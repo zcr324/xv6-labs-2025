@@ -474,6 +474,211 @@ sys_exec(void)
   return -1;
 }
 
+// find the mmap'd region containing virtual address va.
+static struct vma*
+findvma(struct proc *p, uint64 va)
+{
+  struct vma *v;
+  int i;
+
+  for(i = 0; i < NVMA; i++){
+    v = &p->vma[i];
+    if(v->used && va >= v->addr && va < v->addr + v->len)
+      return v;
+  }
+  return 0;
+}
+
+// handle a page fault in an mmap'd region: allocate a page of physical
+// memory, read the corresponding bytes of the mapped file into it, and
+// map it into the process's page table.  Returns the physical address
+// of the page, or 0 if va is not in an mmap'd region (or if something
+// went wrong).
+uint64
+vmafault(struct proc *p, uint64 va, int write)
+{
+  struct vma *v;
+  char *mem;
+  int perm;
+
+  if((v = findvma(p, va)) == 0)
+    return 0;
+
+  // a store to a read-only mapping is fatal.
+  if(write && (v->prot & PROT_WRITE) == 0){
+    setkilled(p);
+    return 0;
+  }
+
+  va = PGROUNDDOWN(va);
+  if(ismapped(p->pagetable, va))
+    return 0;
+
+  if((mem = kalloc()) == 0)
+    return 0;
+  memset(mem, 0, PGSIZE);
+
+  if(v->f->type == FD_INODE){
+    // readi() returns fewer bytes than requested past end of file,
+    // leaving the rest of the page zero, as mmap should.
+    ilock(v->f->ip);
+    readi(v->f->ip, 0, (uint64)mem, v->off + (va - v->addr), PGSIZE);
+    iunlock(v->f->ip);
+  }
+
+  perm = PTE_U | PTE_R;
+  if(v->prot & PROT_WRITE)
+    perm |= PTE_W;
+  if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) != 0){
+    kfree(mem);
+    return 0;
+  }
+  return (uint64)mem;
+}
+
+// write back modifications to the file for any allocated pages in
+// vma v's range [addr, addr+len), if mapped MAP_SHARED, and unmap them.
+// len must be a multiple of PGSIZE and addr page-aligned, as is the
+// case in all of mmaptest.
+static void
+unmapvma(struct vma *v, pagetable_t pagetable, uint64 addr, uint64 len)
+{
+  uint64 a;
+  pte_t *pte;
+  int off, n;
+
+  if(v->flags & MAP_SHARED){
+    for(a = PGROUNDDOWN(addr); a < addr + len; a += PGSIZE){
+      if((pte = walk(pagetable, a, 0)) == 0 || (*pte & PTE_V) == 0)
+        continue;   // never faulted in; nothing to write back
+      off = v->off + (a - v->addr);
+      begin_op();
+      ilock(v->f->ip);
+      // don't write past the end of the file, or the file would
+      // be extended by bytes beyond the mapped data.
+      n = v->f->ip->size - off;
+      if(n > PGSIZE)
+        n = PGSIZE;
+      if(n > 0)
+        writei(v->f->ip, 0, PTE2PA(*pte), off, n);
+      iunlock(v->f->ip);
+      end_op();
+    }
+  }
+  uvmunmap(pagetable, PGROUNDDOWN(addr), PGROUNDUP(len)/PGSIZE, 1);
+}
+
+// unmap all of the current process's mmap'd regions, as if munmap()
+// had been called on each one.  Used on exit and exec.
+void
+munmapall(pagetable_t pagetable)
+{
+  struct proc *p = myproc();
+  int i;
+
+  for(i = 0; i < NVMA; i++){
+    struct vma *v = &p->vma[i];
+    if(v->used){
+      unmapvma(v, pagetable, v->addr, v->len);
+      fileclose(v->f);
+      v->used = 0;
+    }
+  }
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 addr, va;
+  int len, prot, flags, offset;
+  struct file *f;
+  struct proc *p = myproc();
+  struct vma *v;
+  int i;
+
+  argaddr(0, &addr);
+  argint(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  argint(5, &offset);
+  if(argfd(4, 0, &f) < 0)
+    return -1;
+
+  if(addr != 0 || len <= 0 || offset != 0)
+    return -1;
+  if(f->type != FD_INODE)
+    return -1;
+  // a shared writable mapping requires a file opened for writing.
+  if((flags & MAP_SHARED) && (prot & PROT_WRITE) && f->writable == 0)
+    return -1;
+
+  for(i = 0; i < NVMA; i++)
+    if(!p->vma[i].used)
+      break;
+  if(i == NVMA)
+    return -1;
+  v = &p->vma[i];
+
+  // map the file just above the process's heap and all of its
+  // other mmap'd regions, so that regions never overlap.
+  va = PGROUNDUP(p->sz);
+  for(i = 0; i < NVMA; i++)
+    if(p->vma[i].used && p->vma[i].addr + p->vma[i].len > va)
+      va = PGROUNDUP(p->vma[i].addr + p->vma[i].len);
+
+  v->used = 1;
+  v->addr = va;
+  v->len = len;
+  v->prot = prot;
+  v->flags = flags;
+  v->off = offset;
+  v->f = filedup(f);
+
+  return va;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, end;
+  int len;
+  struct proc *p = myproc();
+  struct vma *v;
+  int n;
+
+  argaddr(0, &addr);
+  argint(1, &len);
+  if(len <= 0)
+    return -1;
+
+  if((v = findvma(p, addr)) == 0)
+    return -1;
+
+  // unmap [addr, addr+len), writing back MAP_SHARED modifications.
+  // the lab assumes munmap removes pages at the start or end of the
+  // region, or the whole region, so no hole forms in the middle.
+  end = addr + len;
+  if(end > v->addr + v->len)
+    end = v->addr + v->len;
+  unmapvma(v, p->pagetable, addr, end - addr);
+
+  if(addr <= v->addr && end >= v->addr + v->len){
+    // whole region unmapped
+    fileclose(v->f);
+    v->used = 0;
+  } else if(addr <= v->addr){
+    // removed a chunk at the start of the region
+    n = end - v->addr;
+    v->addr = end;
+    v->len -= n;
+    v->off += n;
+  } else {
+    // removed a chunk at the end of the region
+    v->len = addr - v->addr;
+  }
+  return 0;
+}
+
 uint64
 sys_pipe(void)
 {

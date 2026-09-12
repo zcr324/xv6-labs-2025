@@ -285,6 +285,14 @@ kfork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  // copy mmap'd regions.
+  for(i = 0; i < NVMA; i++){
+    if(p->vma[i].used){
+      np->vma[i] = p->vma[i];
+      filedup(np->vma[i].f);
+    }
+  }
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -336,6 +344,10 @@ kexit(int status)
       p->ofile[fd] = 0;
     }
   }
+
+  // Unmap any mmap'd regions, as if munmap() had been called,
+  // writing back modifications to MAP_SHARED files.
+  munmapall(p->pagetable);
 
   begin_op();
   iput(p->cwd);

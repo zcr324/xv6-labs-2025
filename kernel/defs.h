@@ -41,6 +41,10 @@ int             fileread(struct file*, uint64, int n);
 int             filestat(struct file*, uint64 addr);
 int             filewrite(struct file*, uint64, int n);
 
+// sysfile.c
+uint64          vmafault(struct proc*, uint64, int);
+void            munmapall(pagetable_t);
+
 // fs.c
 void            fsinit(int);
 int             dirlink(struct inode*, char*, uint);
